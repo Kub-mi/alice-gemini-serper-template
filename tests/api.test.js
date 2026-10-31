@@ -132,3 +132,24 @@ test("an empty balance gives a clear spoken message", async () => {
   }
   assert.match(payload.response.text, /Пополните баланс/);
 });
+
+test("an empty balance reported as 401/403 with a text message is still recognised", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const saved = { ...process.env };
+  const savedFetch = globalThis.fetch;
+  process.env.DEEPSEEK_API_KEY = "test-key";
+  process.env.DEEPSEEK_BASE_URL = "https://polza.ai/api/v1";
+  globalThis.fetch = async () => ({ ok: false, status: 403, json: async () => ({ error: { message: "Недостаточно средств на балансе" } }) });
+  let payload;
+  const res = { status() { return this; }, json(value) { payload = value; return value; }, setHeader() {} };
+  const savedError = console.error;
+  console.error = () => {};
+  try {
+    await handler({ method: "POST", body: { request: { command: "привет" } } }, res);
+  } finally {
+    globalThis.fetch = savedFetch;
+    process.env = saved;
+    console.error = savedError;
+  }
+  assert.match(payload.response.text, /Пополните баланс/);
+});

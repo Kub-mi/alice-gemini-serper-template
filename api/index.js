@@ -124,6 +124,18 @@ function aiSettings() {
   return { baseUrl, model, isOfficial };
 }
 
+function errorText(data) {
+  const error = data?.error;
+  const parts = [
+    typeof error === "string" ? error : error?.message,
+    error?.code,
+    error?.type,
+    data?.message,
+    data?.detail
+  ];
+  return parts.filter(part => typeof part === "string" || typeof part === "number").join(" ").trim();
+}
+
 function buildMessages(text, history, searchContext) {
   const messages = [{ role: "system", content: SYSTEM_PROMPT }];
   for (const item of safeHistory(history)) {
@@ -167,9 +179,13 @@ async function askAI(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("AI request failed with HTTP", status, String(data?.error?.message || "").slice(0, 200));
+    const details = errorText(data);
+    console.error("AI request failed with HTTP", status, details.slice(0, 300));
+    // Providers report an empty balance with different HTTP codes (402, 401, 403, 429), so check the text first.
+    if (status === 402 || /balance|insufficient|fund|credit|payment|баланс|недостаточно|пополн/i.test(details)) {
+      throw new Error("AI_NO_BALANCE");
+    }
     if (status === 401 || status === 403) throw new Error("AI_KEY_REJECTED");
-    if (status === 402) throw new Error("AI_NO_BALANCE");
     if (status === 429) throw new Error("AI_QUOTA");
     if (status === 400 || status === 404) throw new Error("AI_BAD_MODEL");
     throw new Error("AI_REQUEST_FAILED");
@@ -187,7 +203,7 @@ function errorForUser(error) {
     case "MISSING_AI_KEY":
       return "Сервер пока не настроен. Проверьте переменную DEEPSEEK_API_KEY в настройках Vercel.";
     case "AI_KEY_REJECTED":
-      return "Не удалось подключиться к нейросети. Проверьте API-ключ в настройках Vercel.";
+      return "Нейросеть не приняла ключ. Проверьте переменные DEEPSEEK_API_KEY и DEEPSEEK_BASE_URL в Vercel.";
     case "AI_NO_BALANCE":
       return "На счёте нейросети закончились деньги. Пополните баланс и попробуйте снова.";
     case "AI_QUOTA":
