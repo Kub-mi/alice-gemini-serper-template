@@ -1,7 +1,7 @@
 const DEFAULT_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_MODEL = "deepseek-flash";
 const DEFAULT_POLZA_MODEL = "deepseek/deepseek-v4.1-flash";
-const MAX_OUTPUT_TOKENS = 200;
+const MAX_OUTPUT_TOKENS = 500;
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -9,23 +9,35 @@ const TOTAL_RESPONSE_BUDGET_MS = 3900;
 const SERPER_TIMEOUT_MS = 600;
 const AI_TIMEOUT_MS = 3000;
 
+const CONTINUE_HINT = " Скажи «дальше», чтобы продолжить.";
+const CONTINUE_PROMPT = "Продолжи ровно с того места, где остановился. Не повторяй уже сказанное и не добавляй вступлений.";
+const MAX_CHUNK_CHARS = MAX_ALICE_TEXT - CONTINUE_HINT.length - 10;
+
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+  "Если просят длинный текст (стихотворение, рассказ), начинай сразу с него, без вступлений: длинный ответ прочитают частями.",
+  "Если пользователь просит продолжить, продолжай ровно с того места, где остановился, без повторов и вступлений.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
 
-function aliceResponse(text, endSession = false, history = []) {
+function aliceResponse(text, endSession = false, history = [], canContinue = false) {
+  const session = { history };
+  if (canContinue) session.cont = true;
   return {
     version: "1.0",
     response: {
       text: fitAliceText(text),
       end_session: endSession
     },
-    session_state: { history }
+    session_state: session
   };
+}
+
+function isContinueRequest(text) {
+  return /^(дальше|продолж\S*|ещё|еще|давай дальше|а дальше|что дальше|читай дальше|go on|continue)[.!?\s]*$/i.test(String(text).trim());
 }
 
 function fitAliceText(value) {
@@ -124,6 +136,18 @@ function aiSettings() {
   return { baseUrl, model, isOfficial };
 }
 
+function errorText(data) {
+  const error = data?.error;
+  const parts = [
+    typeof error === "string" ? error : error?.message,
+    error?.code,
+    error?.type,
+    data?.message,
+    data?.detail
+  ];
+  return parts.filter(part => typeof part === "string" || typeof part === "number").join(" ").trim();
+}
+
 function buildMessages(text, history, searchContext) {
   const messages = [{ role: "system", content: SYSTEM_PROMPT }];
   for (const item of safeHistory(history)) {
@@ -134,6 +158,59 @@ function buildMessages(text, history, searchContext) {
     : text;
   messages.push({ role: "user", content: prompt });
   return messages;
+}
+
+function trimToSentence(value) {
+  const text = String(value || "").trim();
+  const ends = [...text.matchAll(/[.!?…](?=\s|$)/g)];
+  const last = ends.length ? ends[ends.length - 1].index + 1 : -1;
+  if (last >= Math.min(40, text.length * 0.4)) return text.slice(0, last).trim();
+  const lastSpace = text.lastIndexOf(" ");
+  return (lastSpace > 0 ? text.slice(0, lastSpace) : text).replace(/[,;:\-–—\s]+$/, "") + "…";
+}
+
+async function readStream(response, deadline) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let answer = "";
+  let finishReason = null;
+  while (true) {
+    const left = deadline - Date.now();
+    if (left <= 0) {
+      reader.cancel().catch(() => {});
+      return { answer, finishReason, timedOut: true };
+    }
+    let timer;
+    const chunk = await Promise.race([
+      reader.read(),
+      new Promise(resolve => { timer = setTimeout(() => resolve({ timeout: true }), left); })
+    ]);
+    clearTimeout(timer);
+    if (chunk.timeout) {
+      reader.cancel().catch(() => {});
+      return { answer, finishReason, timedOut: true };
+    }
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === "[DONE]") return { answer, finishReason, timedOut: false };
+      try {
+        const event = JSON.parse(payload);
+        const choice = event?.choices?.[0];
+        if (typeof choice?.delta?.content === "string") answer += choice.delta.content;
+        if (choice?.finish_reason) finishReason = choice.finish_reason;
+      } catch {
+        // Ignore keep-alive comments and partial lines.
+      }
+    }
+  }
+  return { answer, finishReason, timedOut: false };
 }
 
 async function askAI(text, history, searchContext, timeoutMs) {
@@ -147,39 +224,69 @@ async function askAI(text, history, searchContext, timeoutMs) {
     messages: buildMessages(text, history, searchContext),
     temperature: 0.5,
     max_tokens: MAX_OUTPUT_TOKENS,
-    stream: false
+    stream: true
   };
   // A voice skill has no time for "thinking" mode, so it is switched off on the official API.
   if (isOfficial) body.thinking = { type: "disabled" };
 
-  const { response, data } = await fetchJson(
-    `${baseUrl}/chat/completions`,
-    {
+  // The answer is streamed: if time runs out, Alice gets the part that is already written.
+  const deadline = Date.now() + Math.min(AI_TIMEOUT_MS, timeoutMs);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(100, deadline - Date.now()));
+  let response;
+  try {
+    response = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "Accept": "text/event-stream",
         "Authorization": `Bearer ${key}`
       },
-      body: JSON.stringify(body)
-    },
-    Math.min(AI_TIMEOUT_MS, timeoutMs)
-  );
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
 
-  if (!response.ok) {
-    const status = Number(response.status);
-    console.error("AI request failed with HTTP", status, String(data?.error?.message || "").slice(0, 200));
-    if (status === 401 || status === 403) throw new Error("AI_KEY_REJECTED");
-    if (status === 402) throw new Error("AI_NO_BALANCE");
-    if (status === 429) throw new Error("AI_QUOTA");
-    if (status === 400 || status === 404) throw new Error("AI_BAD_MODEL");
-    throw new Error("AI_REQUEST_FAILED");
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      const status = Number(response.status);
+      const details = errorText(data);
+      console.error("AI request failed with HTTP", status, details.slice(0, 300));
+      // Providers report an empty balance with different HTTP codes (402, 401, 403, 429), so check the text first.
+      if (status === 402 || /balance|insufficient|fund|credit|payment|баланс|недостаточно|пополн/i.test(details)) {
+        throw new Error("AI_NO_BALANCE");
+      }
+      if (status === 401 || status === 403) throw new Error("AI_KEY_REJECTED");
+      if (status === 429) throw new Error("AI_QUOTA");
+      if (status === 400 || status === 404) throw new Error("AI_BAD_MODEL");
+      throw new Error("AI_REQUEST_FAILED");
+    }
+
+    let result;
+    const contentType = String(response.headers?.get?.("content-type") || "");
+    if (contentType.includes("application/json") || !response.body?.getReader) {
+      // The provider ignored stream: true and sent a regular JSON answer.
+      const data = await response.json().catch(() => ({}));
+      const choice = data?.choices?.[0];
+      result = { answer: String(choice?.message?.content || ""), finishReason: choice?.finish_reason, timedOut: false };
+    } else {
+      result = await readStream(response, deadline);
+    }
+
+    let answer = result.answer.trim();
+    if (!answer) throw new Error(result.timedOut ? "TIME_BUDGET_EXHAUSTED" : "AI_EMPTY_RESPONSE");
+    let cut = false;
+    if (result.timedOut || result.finishReason === "length" || answer.length > MAX_CHUNK_CHARS) {
+      console.warn("AI answer was cut:", result.timedOut ? "time limit" : "length limit");
+      answer = trimToSentence(answer.slice(0, MAX_CHUNK_CHARS));
+      cut = true;
+    }
+    return { answer, cut };
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("TIME_BUDGET_EXHAUSTED");
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-
-  const choice = data?.choices?.[0];
-  const answer = String(choice?.message?.content || "").trim();
-  if (!answer) throw new Error("AI_EMPTY_RESPONSE");
-  if (choice?.finish_reason === "length") console.warn("AI reached the output token limit.");
-  return answer;
 }
 
 function errorForUser(error) {
@@ -187,7 +294,7 @@ function errorForUser(error) {
     case "MISSING_AI_KEY":
       return "Сервер пока не настроен. Проверьте переменную DEEPSEEK_API_KEY в настройках Vercel.";
     case "AI_KEY_REJECTED":
-      return "Не удалось подключиться к нейросети. Проверьте API-ключ в настройках Vercel.";
+      return "Нейросеть не приняла ключ. Проверьте переменные DEEPSEEK_API_KEY и DEEPSEEK_BASE_URL в Vercel.";
     case "AI_NO_BALANCE":
       return "На счёте нейросети закончились деньги. Пополните баланс и попробуйте снова.";
     case "AI_QUOTA":
@@ -223,6 +330,7 @@ export default async function handler(req, res) {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   const oldHistory = safeHistory(body?.state?.session?.history);
+  const canResume = body?.state?.session?.cont === true && oldHistory.at(-1)?.role === "model";
 
   if (!text) {
     return res.status(200).json(aliceResponse(
@@ -233,14 +341,15 @@ export default async function handler(req, res) {
   }
 
   try {
+    const continuing = canResume && isContinueRequest(text);
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+    if (!continuing && isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 3200)));
     }
 
-    const answer = await askAI(
-      text,
+    const { answer, cut } = await askAI(
+      continuing ? CONTINUE_PROMPT : text,
       oldHistory,
       searchContext,
       Math.max(0, Math.min(AI_TIMEOUT_MS, remainingMs() - 300))
@@ -252,12 +361,13 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
-    return res.status(200).json(aliceResponse(answer, false, history));
+    return res.status(200).json(aliceResponse(cut ? answer + CONTINUE_HINT : answer, false, history, cut));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
+    // Keep the "continue" option alive so the user can simply say "дальше" again.
+    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory, canResume));
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, buildMessages, aiSettings };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, buildMessages, aiSettings, trimToSentence, isContinueRequest };

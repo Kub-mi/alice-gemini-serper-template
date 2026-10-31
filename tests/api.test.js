@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, fitAliceText, isSearchIntent, safeHistory, buildMessages, aiSettings } from "../api/index.js";
+import { aliceResponse, fitAliceText, isSearchIntent, safeHistory, buildMessages, aiSettings, trimToSentence, isContinueRequest } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -131,4 +131,132 @@ test("an empty balance gives a clear spoken message", async () => {
     console.error = savedError;
   }
   assert.match(payload.response.text, /Пополните баланс/);
+});
+
+test("an empty balance reported as 401/403 with a text message is still recognised", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const saved = { ...process.env };
+  const savedFetch = globalThis.fetch;
+  process.env.DEEPSEEK_API_KEY = "test-key";
+  process.env.DEEPSEEK_BASE_URL = "https://polza.ai/api/v1";
+  globalThis.fetch = async () => ({ ok: false, status: 403, json: async () => ({ error: { message: "Недостаточно средств на балансе" } }) });
+  let payload;
+  const res = { status() { return this; }, json(value) { payload = value; return value; }, setHeader() {} };
+  const savedError = console.error;
+  console.error = () => {};
+  try {
+    await handler({ method: "POST", body: { request: { command: "привет" } } }, res);
+  } finally {
+    globalThis.fetch = savedFetch;
+    process.env = saved;
+    console.error = savedError;
+  }
+  assert.match(payload.response.text, /Пополните баланс/);
+});
+
+test("cut answers end on a full sentence", () => {
+  assert.equal(trimToSentence("Буря мглою небо кроет. Вихри снежные крутя. То, как зверь"), "Буря мглою небо кроет. Вихри снежные крутя.");
+  assert.equal(trimToSentence("Очень длинная фраза без точки, которая обрывается на сере"), "Очень длинная фраза без точки, которая обрывается на…");
+});
+
+function sseResponse(chunks, { hangAfter = false } = {}) {
+  const encoder = new TextEncoder();
+  let i = 0;
+  return {
+    ok: true,
+    status: 200,
+    headers: { get: () => "text/event-stream" },
+    body: {
+      getReader: () => ({
+        read: () => {
+          if (i < chunks.length) return Promise.resolve({ done: false, value: encoder.encode(chunks[i++]) });
+          if (hangAfter) return new Promise(() => {});
+          return Promise.resolve({ done: true });
+        },
+        cancel: () => Promise.resolve()
+      })
+    }
+  };
+}
+
+const sse = (content, finish = null) => `data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: finish }] })}\n\n`;
+
+async function askHandler(fetchImpl, request = { request: { command: "прочитай стих" } }) {
+  const handler = (await import("../api/index.js")).default;
+  const saved = { ...process.env };
+  const savedFetch = globalThis.fetch;
+  const savedWarn = console.warn;
+  process.env.DEEPSEEK_API_KEY = "test-key";
+  process.env.DEEPSEEK_BASE_URL = "https://polza.ai/api/v1";
+  delete process.env.SERPER_API_KEY;
+  globalThis.fetch = fetchImpl;
+  console.warn = () => {};
+  let payload;
+  const res = { status() { return this; }, json(value) { payload = value; return value; }, setHeader() {} };
+  try {
+    await handler({ method: "POST", body: request }, res);
+  } finally {
+    globalThis.fetch = savedFetch;
+    process.env = saved;
+    console.warn = savedWarn;
+  }
+  return payload;
+}
+
+test("a streamed answer is assembled from chunks", async () => {
+  const payload = await askHandler(async () => sseResponse([sse("Буря мглою "), sse("небо кроет."), sse("", "stop"), "data: [DONE]\n\n"]));
+  assert.equal(payload.response.text, "Буря мглою небо кроет.");
+  assert.equal(payload.session_state.cont, undefined);
+});
+
+test("an answer cut by the token limit ends on a full sentence", async () => {
+  const payload = await askHandler(async () => sseResponse([sse("Буря мглою небо кроет. Вихри снежные "), sse("", "length"), "data: [DONE]\n\n"]));
+  assert.equal(payload.response.text, "Буря мглою небо кроет. Скажи «дальше», чтобы продолжить.");
+  assert.equal(payload.session_state.cont, true);
+  assert.equal(payload.session_state.history.at(-1).text, "Буря мглою небо кроет.");
+});
+
+test("a slow stream returns the part written before the deadline", async () => {
+  const started = Date.now();
+  const payload = await askHandler(async () => sseResponse([sse("Буря мглою небо кроет. Вихри снежные крутя. То, как")], { hangAfter: true }));
+  assert.equal(payload.response.text, "Буря мглою небо кроет. Вихри снежные крутя. Скажи «дальше», чтобы продолжить.");
+  assert.ok(Date.now() - started < 4200);
+});
+
+test("a request that times out before any text says so instead of a generic error", async () => {
+  const payload = await askHandler((url, options) => new Promise((_, reject) => {
+    options.signal.addEventListener("abort", () => {
+      const error = new Error("This operation was aborted");
+      error.name = "AbortError";
+      reject(error);
+    });
+  }));
+  assert.match(payload.response.text, /Не успела/);
+});
+
+test("continue phrases are recognised", () => {
+  for (const phrase of ["дальше", "Дальше.", "продолжай", "продолжи", "ещё", "давай дальше"]) assert.equal(isContinueRequest(phrase), true, phrase);
+  assert.equal(isContinueRequest("расскажи дальше про космос"), false);
+});
+
+test("saying 'дальше' after a cut answer asks the model to continue", async () => {
+  let sentMessages;
+  const history = [{ role: "user", text: "прочитай стих" }, { role: "model", text: "Буря мглою небо кроет." }];
+  const payload = await askHandler(async (url, options) => {
+    sentMessages = JSON.parse(options.body).messages;
+    return sseResponse([sse("Вихри снежные крутя."), sse("", "stop"), "data: [DONE]\n\n"]);
+  }, { request: { command: "дальше" }, state: { session: { history, cont: true } } });
+  assert.equal(sentMessages.at(-2).content, "Буря мглою небо кроет.");
+  assert.match(sentMessages.at(-1).content, /Продолжи ровно с того места/);
+  assert.equal(payload.response.text, "Вихри снежные крутя.");
+  assert.equal(payload.session_state.cont, undefined);
+});
+
+test("'дальше' without a cut answer is treated as a normal question", async () => {
+  let sentMessages;
+  await askHandler(async (url, options) => {
+    sentMessages = JSON.parse(options.body).messages;
+    return sseResponse([sse("Хорошо."), sse("", "stop"), "data: [DONE]\n\n"]);
+  }, { request: { command: "дальше" }, state: { session: { history: [] } } });
+  assert.equal(sentMessages.at(-1).content, "дальше");
 });
