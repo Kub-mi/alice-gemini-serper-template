@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, fitAliceText, isSearchIntent, safeHistory, buildMessages, aiSettings } from "../api/index.js";
+import { aliceResponse, fitAliceText, isSearchIntent, safeHistory, buildMessages, aiSettings, trimToSentence } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -152,4 +152,81 @@ test("an empty balance reported as 401/403 with a text message is still recognis
     console.error = savedError;
   }
   assert.match(payload.response.text, /Пополните баланс/);
+});
+
+test("cut answers end on a full sentence", () => {
+  assert.equal(trimToSentence("Буря мглою небо кроет. Вихри снежные крутя. То, как зверь"), "Буря мглою небо кроет. Вихри снежные крутя.");
+  assert.equal(trimToSentence("Очень длинная фраза без точки, которая обрывается на сере"), "Очень длинная фраза без точки, которая обрывается на…");
+});
+
+function sseResponse(chunks, { hangAfter = false } = {}) {
+  const encoder = new TextEncoder();
+  let i = 0;
+  return {
+    ok: true,
+    status: 200,
+    headers: { get: () => "text/event-stream" },
+    body: {
+      getReader: () => ({
+        read: () => {
+          if (i < chunks.length) return Promise.resolve({ done: false, value: encoder.encode(chunks[i++]) });
+          if (hangAfter) return new Promise(() => {});
+          return Promise.resolve({ done: true });
+        },
+        cancel: () => Promise.resolve()
+      })
+    }
+  };
+}
+
+const sse = (content, finish = null) => `data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: finish }] })}\n\n`;
+
+async function askHandler(fetchImpl) {
+  const handler = (await import("../api/index.js")).default;
+  const saved = { ...process.env };
+  const savedFetch = globalThis.fetch;
+  const savedWarn = console.warn;
+  process.env.DEEPSEEK_API_KEY = "test-key";
+  process.env.DEEPSEEK_BASE_URL = "https://polza.ai/api/v1";
+  delete process.env.SERPER_API_KEY;
+  globalThis.fetch = fetchImpl;
+  console.warn = () => {};
+  let payload;
+  const res = { status() { return this; }, json(value) { payload = value; return value; }, setHeader() {} };
+  try {
+    await handler({ method: "POST", body: { request: { command: "прочитай стих" } } }, res);
+  } finally {
+    globalThis.fetch = savedFetch;
+    process.env = saved;
+    console.warn = savedWarn;
+  }
+  return payload;
+}
+
+test("a streamed answer is assembled from chunks", async () => {
+  const payload = await askHandler(async () => sseResponse([sse("Буря мглою "), sse("небо кроет."), sse("", "stop"), "data: [DONE]\n\n"]));
+  assert.equal(payload.response.text, "Буря мглою небо кроет.");
+});
+
+test("an answer cut by the token limit ends on a full sentence", async () => {
+  const payload = await askHandler(async () => sseResponse([sse("Буря мглою небо кроет. Вихри снежные "), sse("", "length"), "data: [DONE]\n\n"]));
+  assert.equal(payload.response.text, "Буря мглою небо кроет.");
+});
+
+test("a slow stream returns the part written before the deadline", async () => {
+  const started = Date.now();
+  const payload = await askHandler(async () => sseResponse([sse("Буря мглою небо кроет. Вихри снежные крутя. То, как")], { hangAfter: true }));
+  assert.equal(payload.response.text, "Буря мглою небо кроет. Вихри снежные крутя.");
+  assert.ok(Date.now() - started < 4200);
+});
+
+test("a request that times out before any text says so instead of a generic error", async () => {
+  const payload = await askHandler((url, options) => new Promise((_, reject) => {
+    options.signal.addEventListener("abort", () => {
+      const error = new Error("This operation was aborted");
+      error.name = "AbortError";
+      reject(error);
+    });
+  }));
+  assert.match(payload.response.text, /Не успела/);
 });

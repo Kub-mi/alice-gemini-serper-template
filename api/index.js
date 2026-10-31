@@ -1,7 +1,7 @@
 const DEFAULT_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_MODEL = "deepseek-flash";
 const DEFAULT_POLZA_MODEL = "deepseek/deepseek-v4.1-flash";
-const MAX_OUTPUT_TOKENS = 200;
+const MAX_OUTPUT_TOKENS = 500;
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -14,6 +14,7 @@ const SYSTEM_PROMPT = [
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+  "Если просят длинный текст (стихотворение, рассказ, перечень), уложись примерно в 500 символов: например, прочитай первую строфу.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
 
@@ -148,6 +149,59 @@ function buildMessages(text, history, searchContext) {
   return messages;
 }
 
+function trimToSentence(value) {
+  const text = String(value || "").trim();
+  const ends = [...text.matchAll(/[.!?…](?=\s|$)/g)];
+  const last = ends.length ? ends[ends.length - 1].index + 1 : -1;
+  if (last >= Math.min(40, text.length * 0.4)) return text.slice(0, last).trim();
+  const lastSpace = text.lastIndexOf(" ");
+  return (lastSpace > 0 ? text.slice(0, lastSpace) : text).replace(/[,;:\-–—\s]+$/, "") + "…";
+}
+
+async function readStream(response, deadline) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let answer = "";
+  let finishReason = null;
+  while (true) {
+    const left = deadline - Date.now();
+    if (left <= 0) {
+      reader.cancel().catch(() => {});
+      return { answer, finishReason, timedOut: true };
+    }
+    let timer;
+    const chunk = await Promise.race([
+      reader.read(),
+      new Promise(resolve => { timer = setTimeout(() => resolve({ timeout: true }), left); })
+    ]);
+    clearTimeout(timer);
+    if (chunk.timeout) {
+      reader.cancel().catch(() => {});
+      return { answer, finishReason, timedOut: true };
+    }
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === "[DONE]") return { answer, finishReason, timedOut: false };
+      try {
+        const event = JSON.parse(payload);
+        const choice = event?.choices?.[0];
+        if (typeof choice?.delta?.content === "string") answer += choice.delta.content;
+        if (choice?.finish_reason) finishReason = choice.finish_reason;
+      } catch {
+        // Ignore keep-alive comments and partial lines.
+      }
+    }
+  }
+  return { answer, finishReason, timedOut: false };
+}
+
 async function askAI(text, history, searchContext, timeoutMs) {
   const key = String(process.env.DEEPSEEK_API_KEY || "").trim();
   if (!key) throw new Error("MISSING_AI_KEY");
@@ -159,43 +213,67 @@ async function askAI(text, history, searchContext, timeoutMs) {
     messages: buildMessages(text, history, searchContext),
     temperature: 0.5,
     max_tokens: MAX_OUTPUT_TOKENS,
-    stream: false
+    stream: true
   };
   // A voice skill has no time for "thinking" mode, so it is switched off on the official API.
   if (isOfficial) body.thinking = { type: "disabled" };
 
-  const { response, data } = await fetchJson(
-    `${baseUrl}/chat/completions`,
-    {
+  // The answer is streamed: if time runs out, Alice gets the part that is already written.
+  const deadline = Date.now() + Math.min(AI_TIMEOUT_MS, timeoutMs);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(100, deadline - Date.now()));
+  let response;
+  try {
+    response = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "Accept": "text/event-stream",
         "Authorization": `Bearer ${key}`
       },
-      body: JSON.stringify(body)
-    },
-    Math.min(AI_TIMEOUT_MS, timeoutMs)
-  );
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
 
-  if (!response.ok) {
-    const status = Number(response.status);
-    const details = errorText(data);
-    console.error("AI request failed with HTTP", status, details.slice(0, 300));
-    // Providers report an empty balance with different HTTP codes (402, 401, 403, 429), so check the text first.
-    if (status === 402 || /balance|insufficient|fund|credit|payment|баланс|недостаточно|пополн/i.test(details)) {
-      throw new Error("AI_NO_BALANCE");
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      const status = Number(response.status);
+      const details = errorText(data);
+      console.error("AI request failed with HTTP", status, details.slice(0, 300));
+      // Providers report an empty balance with different HTTP codes (402, 401, 403, 429), so check the text first.
+      if (status === 402 || /balance|insufficient|fund|credit|payment|баланс|недостаточно|пополн/i.test(details)) {
+        throw new Error("AI_NO_BALANCE");
+      }
+      if (status === 401 || status === 403) throw new Error("AI_KEY_REJECTED");
+      if (status === 429) throw new Error("AI_QUOTA");
+      if (status === 400 || status === 404) throw new Error("AI_BAD_MODEL");
+      throw new Error("AI_REQUEST_FAILED");
     }
-    if (status === 401 || status === 403) throw new Error("AI_KEY_REJECTED");
-    if (status === 429) throw new Error("AI_QUOTA");
-    if (status === 400 || status === 404) throw new Error("AI_BAD_MODEL");
-    throw new Error("AI_REQUEST_FAILED");
-  }
 
-  const choice = data?.choices?.[0];
-  const answer = String(choice?.message?.content || "").trim();
-  if (!answer) throw new Error("AI_EMPTY_RESPONSE");
-  if (choice?.finish_reason === "length") console.warn("AI reached the output token limit.");
-  return answer;
+    let result;
+    const contentType = String(response.headers?.get?.("content-type") || "");
+    if (contentType.includes("application/json") || !response.body?.getReader) {
+      // The provider ignored stream: true and sent a regular JSON answer.
+      const data = await response.json().catch(() => ({}));
+      const choice = data?.choices?.[0];
+      result = { answer: String(choice?.message?.content || ""), finishReason: choice?.finish_reason, timedOut: false };
+    } else {
+      result = await readStream(response, deadline);
+    }
+
+    let answer = result.answer.trim();
+    if (!answer) throw new Error(result.timedOut ? "TIME_BUDGET_EXHAUSTED" : "AI_EMPTY_RESPONSE");
+    if (result.timedOut || result.finishReason === "length") {
+      console.warn("AI answer was cut:", result.timedOut ? "time limit" : "token limit");
+      answer = trimToSentence(answer);
+    }
+    return answer;
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("TIME_BUDGET_EXHAUSTED");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function errorForUser(error) {
@@ -270,10 +348,10 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, buildMessages, aiSettings };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, buildMessages, aiSettings, trimToSentence };
