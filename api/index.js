@@ -1,10 +1,13 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_BASE_URL = "https://api.deepseek.com";
+const DEFAULT_MODEL = "deepseek-flash";
+const DEFAULT_POLZA_MODEL = "deepseek/deepseek-v4.1-flash";
+const MAX_OUTPUT_TOKENS = 200;
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
+const TOTAL_RESPONSE_BUDGET_MS = 3900;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const AI_TIMEOUT_MS = 3000;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -110,78 +113,89 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+function aiSettings() {
+  const baseUrl = String(process.env.DEEPSEEK_BASE_URL || DEFAULT_BASE_URL).trim().replace(/\/+$/, "");
+  if (!/^https:\/\/[A-Za-z0-9.-]+(:\d+)?(\/[A-Za-z0-9._~\/-]*)?$/.test(baseUrl)) throw new Error("INVALID_BASE_URL");
+  const isOfficial = /^https:\/\/api\.deepseek\.com(\/|$)/.test(baseUrl);
+  const isPolza = /^https:\/\/([a-z0-9-]+\.)*polza\.ai(\/|$)/.test(baseUrl);
+  const defaultModel = isPolza ? DEFAULT_POLZA_MODEL : DEFAULT_MODEL;
+  const model = String(process.env.DEEPSEEK_MODEL || defaultModel).trim();
+  if (!/^[A-Za-z0-9._:\/-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  return { baseUrl, model, isOfficial };
+}
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
-
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
-
+function buildMessages(text, history, searchContext) {
+  const messages = [{ role: "system", content: SYSTEM_PROMPT }];
+  for (const item of safeHistory(history)) {
+    messages.push({ role: item.role === "model" ? "assistant" : "user", content: item.text });
+  }
   const prompt = searchContext
     ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
     : text;
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+  messages.push({ role: "user", content: prompt });
+  return messages;
+}
+
+async function askAI(text, history, searchContext, timeoutMs) {
+  const key = String(process.env.DEEPSEEK_API_KEY || "").trim();
+  if (!key) throw new Error("MISSING_AI_KEY");
+  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+
+  const { baseUrl, model, isOfficial } = aiSettings();
+  const body = {
+    model,
+    messages: buildMessages(text, history, searchContext),
+    temperature: 0.5,
+    max_tokens: MAX_OUTPUT_TOKENS,
+    stream: false
+  };
+  // A voice skill has no time for "thinking" mode, so it is switched off on the official API.
+  if (isOfficial) body.thinking = { type: "disabled" };
 
   const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    `${baseUrl}/chat/completions`,
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": key
+        "Authorization": `Bearer ${key}`
       },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
-      })
+      body: JSON.stringify(body)
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    Math.min(AI_TIMEOUT_MS, timeoutMs)
   );
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
+    console.error("AI request failed with HTTP", status, String(data?.error?.message || "").slice(0, 200));
+    if (status === 401 || status === 403) throw new Error("AI_KEY_REJECTED");
+    if (status === 402) throw new Error("AI_NO_BALANCE");
+    if (status === 429) throw new Error("AI_QUOTA");
+    if (status === 400 || status === 404) throw new Error("AI_BAD_MODEL");
+    throw new Error("AI_REQUEST_FAILED");
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
-
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
+  const choice = data?.choices?.[0];
+  const answer = String(choice?.message?.content || "").trim();
+  if (!answer) throw new Error("AI_EMPTY_RESPONSE");
+  if (choice?.finish_reason === "length") console.warn("AI reached the output token limit.");
   return answer;
 }
 
 function errorForUser(error) {
   switch (error?.message) {
-    case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
-    case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
-    case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
-    case "GEMINI_BLOCKED":
-      return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+    case "MISSING_AI_KEY":
+      return "Сервер пока не настроен. Проверьте переменную DEEPSEEK_API_KEY в настройках Vercel.";
+    case "AI_KEY_REJECTED":
+      return "Не удалось подключиться к нейросети. Проверьте API-ключ в настройках Vercel.";
+    case "AI_NO_BALANCE":
+      return "На счёте нейросети закончились деньги. Пополните баланс и попробуйте снова.";
+    case "AI_QUOTA":
+      return "Сейчас превышен лимит запросов к нейросети. Попробуйте немного позже.";
+    case "AI_BAD_MODEL":
+    case "INVALID_MODEL_NAME":
+    case "INVALID_BASE_URL":
+      return "Нейросеть не приняла запрос. Проверьте переменные DEEPSEEK_MODEL и DEEPSEEK_BASE_URL в Vercel.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
@@ -194,7 +208,7 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      service: "alice-gemini-serper",
+      service: "alice-deepseek-serper",
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
@@ -222,14 +236,14 @@ export default async function handler(req, res) {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 3200)));
     }
 
-    const answer = await askGemini(
+    const answer = await askAI(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(AI_TIMEOUT_MS, remainingMs() - 300))
     );
 
     const history = [
@@ -246,4 +260,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, buildMessages, aiSettings };
