@@ -9,24 +9,35 @@ const TOTAL_RESPONSE_BUDGET_MS = 3900;
 const SERPER_TIMEOUT_MS = 600;
 const AI_TIMEOUT_MS = 3000;
 
+const CONTINUE_HINT = " Скажи «дальше», чтобы продолжить.";
+const CONTINUE_PROMPT = "Продолжи ровно с того места, где остановился. Не повторяй уже сказанное и не добавляй вступлений.";
+const MAX_CHUNK_CHARS = MAX_ALICE_TEXT - CONTINUE_HINT.length - 10;
+
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-  "Если просят длинный текст (стихотворение, рассказ, перечень), уложись примерно в 500 символов: например, прочитай первую строфу.",
+  "Если просят длинный текст (стихотворение, рассказ), начинай сразу с него, без вступлений: длинный ответ прочитают частями.",
+  "Если пользователь просит продолжить, продолжай ровно с того места, где остановился, без повторов и вступлений.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
 
-function aliceResponse(text, endSession = false, history = []) {
+function aliceResponse(text, endSession = false, history = [], canContinue = false) {
+  const session = { history };
+  if (canContinue) session.cont = true;
   return {
     version: "1.0",
     response: {
       text: fitAliceText(text),
       end_session: endSession
     },
-    session_state: { history }
+    session_state: session
   };
+}
+
+function isContinueRequest(text) {
+  return /^(дальше|продолж\S*|ещё|еще|давай дальше|а дальше|что дальше|читай дальше|go on|continue)[.!?\s]*$/i.test(String(text).trim());
 }
 
 function fitAliceText(value) {
@@ -263,11 +274,13 @@ async function askAI(text, history, searchContext, timeoutMs) {
 
     let answer = result.answer.trim();
     if (!answer) throw new Error(result.timedOut ? "TIME_BUDGET_EXHAUSTED" : "AI_EMPTY_RESPONSE");
-    if (result.timedOut || result.finishReason === "length") {
-      console.warn("AI answer was cut:", result.timedOut ? "time limit" : "token limit");
-      answer = trimToSentence(answer);
+    let cut = false;
+    if (result.timedOut || result.finishReason === "length" || answer.length > MAX_CHUNK_CHARS) {
+      console.warn("AI answer was cut:", result.timedOut ? "time limit" : "length limit");
+      answer = trimToSentence(answer.slice(0, MAX_CHUNK_CHARS));
+      cut = true;
     }
-    return answer;
+    return { answer, cut };
   } catch (error) {
     if (error?.name === "AbortError") throw new Error("TIME_BUDGET_EXHAUSTED");
     throw error;
@@ -317,6 +330,7 @@ export default async function handler(req, res) {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   const oldHistory = safeHistory(body?.state?.session?.history);
+  const canResume = body?.state?.session?.cont === true && oldHistory.at(-1)?.role === "model";
 
   if (!text) {
     return res.status(200).json(aliceResponse(
@@ -327,14 +341,15 @@ export default async function handler(req, res) {
   }
 
   try {
+    const continuing = canResume && isContinueRequest(text);
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+    if (!continuing && isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 3200)));
     }
 
-    const answer = await askAI(
-      text,
+    const { answer, cut } = await askAI(
+      continuing ? CONTINUE_PROMPT : text,
       oldHistory,
       searchContext,
       Math.max(0, Math.min(AI_TIMEOUT_MS, remainingMs() - 300))
@@ -346,12 +361,13 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
-    return res.status(200).json(aliceResponse(answer, false, history));
+    return res.status(200).json(aliceResponse(cut ? answer + CONTINUE_HINT : answer, false, history, cut));
   } catch (error) {
     const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
+    // Keep the "continue" option alive so the user can simply say "дальше" again.
+    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory, canResume));
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, buildMessages, aiSettings, trimToSentence };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, buildMessages, aiSettings, trimToSentence, isContinueRequest };
