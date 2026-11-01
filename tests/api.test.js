@@ -203,6 +203,16 @@ async function askHandler(fetchImpl, request = { request: { command: "прочи
   return payload;
 }
 
+test("polza.ai requests switch reasoning off", async () => {
+  let sentBody;
+  await askHandler(async (url, options) => {
+    sentBody = JSON.parse(options.body);
+    return sseResponse([sse("Да."), sse("", "stop"), "data: [DONE]\n\n"]);
+  });
+  assert.deepEqual(sentBody.reasoning, { effort: "none" });
+  assert.equal(sentBody.thinking, undefined);
+});
+
 test("a streamed answer is assembled from chunks", async () => {
   const payload = await askHandler(async () => sseResponse([sse("Буря мглою "), sse("небо кроет."), sse("", "stop"), "data: [DONE]\n\n"]));
   assert.equal(payload.response.text, "Буря мглою небо кроет.");
