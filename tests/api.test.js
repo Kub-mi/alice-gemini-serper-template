@@ -203,6 +203,16 @@ async function askHandler(fetchImpl, request = { request: { command: "прочи
   return payload;
 }
 
+test("polza.ai requests switch reasoning off", async () => {
+  let sentBody;
+  await askHandler(async (url, options) => {
+    sentBody = JSON.parse(options.body);
+    return sseResponse([sse("Да."), sse("", "stop"), "data: [DONE]\n\n"]);
+  });
+  assert.deepEqual(sentBody.reasoning, { effort: "none" });
+  assert.equal(sentBody.thinking, undefined);
+});
+
 test("a streamed answer is assembled from chunks", async () => {
   const payload = await askHandler(async () => sseResponse([sse("Буря мглою "), sse("небо кроет."), sse("", "stop"), "data: [DONE]\n\n"]));
   assert.equal(payload.response.text, "Буря мглою небо кроет.");
@@ -259,4 +269,12 @@ test("'дальше' without a cut answer is treated as a normal question", asyn
     return sseResponse([sse("Хорошо."), sse("", "stop"), "data: [DONE]\n\n"]);
   }, { request: { command: "дальше" }, state: { session: { history: [] } } });
   assert.equal(sentMessages.at(-1).content, "дальше");
+});
+
+test("a model that is not allowed for the key is reported as a model problem", async () => {
+  const savedError = console.error;
+  console.error = () => {};
+  const payload = await askHandler(async () => ({ ok: false, status: 403, json: async () => ({ error: { message: 'Модель "deepseek/deepseek-v4.1-flash" недоступна для данного API-ключа', code: "FORBIDDEN" } }) }));
+  console.error = savedError;
+  assert.match(payload.response.text, /модель нейросети недоступна/);
 });

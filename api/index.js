@@ -5,9 +5,9 @@ const MAX_OUTPUT_TOKENS = 500;
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3900;
+const TOTAL_RESPONSE_BUDGET_MS = 4100;
 const SERPER_TIMEOUT_MS = 600;
-const AI_TIMEOUT_MS = 3000;
+const AI_TIMEOUT_MS = 3400;
 
 const CONTINUE_HINT = " Скажи «дальше», чтобы продолжить.";
 const CONTINUE_PROMPT = "Продолжи ровно с того места, где остановился. Не повторяй уже сказанное и не добавляй вступлений.";
@@ -175,6 +175,7 @@ async function readStream(response, deadline) {
   let buffer = "";
   let answer = "";
   let finishReason = null;
+  let sawReasoning = false;
   while (true) {
     const left = deadline - Date.now();
     if (left <= 0) {
@@ -203,7 +204,12 @@ async function readStream(response, deadline) {
       try {
         const event = JSON.parse(payload);
         const choice = event?.choices?.[0];
+        if (event?.error) console.error("AI stream error:", String(event.error?.message || event.error).slice(0, 300));
         if (typeof choice?.delta?.content === "string") answer += choice.delta.content;
+        if (!answer && !sawReasoning && (choice?.delta?.reasoning || choice?.delta?.reasoning_content)) {
+          sawReasoning = true;
+          console.warn("AI model is thinking before answering; this is slow for a voice skill.");
+        }
         if (choice?.finish_reason) finishReason = choice.finish_reason;
       } catch {
         // Ignore keep-alive comments and partial lines.
@@ -226,8 +232,11 @@ async function askAI(text, history, searchContext, timeoutMs) {
     max_tokens: MAX_OUTPUT_TOKENS,
     stream: true
   };
-  // A voice skill has no time for "thinking" mode, so it is switched off on the official API.
+  // A voice skill has no time for "thinking" mode: DeepSeek V4 models think by default and stay silent
+  // for several seconds. The official API and polza.ai (OpenRouter-style) switch it off differently;
+  // polza.ai silently drops the block for models without reasoning.
   if (isOfficial) body.thinking = { type: "disabled" };
+  else body.reasoning = { effort: "none" };
 
   // The answer is streamed: if time runs out, Alice gets the part that is already written.
   const deadline = Date.now() + Math.min(AI_TIMEOUT_MS, timeoutMs);
@@ -255,6 +264,7 @@ async function askAI(text, history, searchContext, timeoutMs) {
       if (status === 402 || /balance|insufficient|fund|credit|payment|баланс|недостаточно|пополн/i.test(details)) {
         throw new Error("AI_NO_BALANCE");
       }
+      if (/модел|model/i.test(details) && status !== 401) throw new Error("AI_BAD_MODEL");
       if (status === 401 || status === 403) throw new Error("AI_KEY_REJECTED");
       if (status === 429) throw new Error("AI_QUOTA");
       if (status === 400 || status === 404) throw new Error("AI_BAD_MODEL");
@@ -302,7 +312,7 @@ function errorForUser(error) {
     case "AI_BAD_MODEL":
     case "INVALID_MODEL_NAME":
     case "INVALID_BASE_URL":
-      return "Нейросеть не приняла запрос. Проверьте переменные DEEPSEEK_MODEL и DEEPSEEK_BASE_URL в Vercel.";
+      return "Эта модель нейросети недоступна для вашего ключа. Проверьте ограничения ключа в polza.ai или переменную DEEPSEEK_MODEL в Vercel.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
@@ -345,7 +355,7 @@ export default async function handler(req, res) {
     let searchContext = "";
     if (!continuing && isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 3200)));
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 3600)));
     }
 
     const { answer, cut } = await askAI(
