@@ -264,6 +264,7 @@ async function askAI(text, history, searchContext, timeoutMs) {
       if (status === 402 || /balance|insufficient|fund|credit|payment|баланс|недостаточно|пополн/i.test(details)) {
         throw new Error("AI_NO_BALANCE");
       }
+      if (/модел|model/i.test(details) && status !== 401) throw new Error("AI_BAD_MODEL");
       if (status === 401 || status === 403) throw new Error("AI_KEY_REJECTED");
       if (status === 429) throw new Error("AI_QUOTA");
       if (status === 400 || status === 404) throw new Error("AI_BAD_MODEL");
@@ -311,7 +312,7 @@ function errorForUser(error) {
     case "AI_BAD_MODEL":
     case "INVALID_MODEL_NAME":
     case "INVALID_BASE_URL":
-      return "Нейросеть не приняла запрос. Проверьте переменные DEEPSEEK_MODEL и DEEPSEEK_BASE_URL в Vercel.";
+      return "Эта модель нейросети недоступна для вашего ключа. Проверьте ограничения ключа в polza.ai или переменную DEEPSEEK_MODEL в Vercel.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";

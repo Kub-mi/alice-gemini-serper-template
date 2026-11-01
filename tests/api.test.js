@@ -270,3 +270,11 @@ test("'дальше' without a cut answer is treated as a normal question", asyn
   }, { request: { command: "дальше" }, state: { session: { history: [] } } });
   assert.equal(sentMessages.at(-1).content, "дальше");
 });
+
+test("a model that is not allowed for the key is reported as a model problem", async () => {
+  const savedError = console.error;
+  console.error = () => {};
+  const payload = await askHandler(async () => ({ ok: false, status: 403, json: async () => ({ error: { message: 'Модель "deepseek/deepseek-v4.1-flash" недоступна для данного API-ключа', code: "FORBIDDEN" } }) }));
+  console.error = savedError;
+  assert.match(payload.response.text, /модель нейросети недоступна/);
+});
